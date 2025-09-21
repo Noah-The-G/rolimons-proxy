@@ -106,7 +106,7 @@ app.get("/avatarValue", async (req, res) => {
       const r = sumSpansInRoot($, root, selector);
       if (r.values && r.values.length) {
         collected = { values: r.values, samples: r.samples, from: sel, sourceSelector: selector };
-        break; --0; // eslint-disable-line no-unused-expressions
+        break;
       }
     }
   }
