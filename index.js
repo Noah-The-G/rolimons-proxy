@@ -1,4 +1,4 @@
-// index.js - Rolimons proxy (inventory limiteds summing with item details)
+// index.js - Rolimons proxy (scan .text-light.text-truncate inside inventory sections)
 const express = require("express");
 const axios = require("axios");
 const cheerio = require("cheerio");
@@ -8,72 +8,59 @@ const PORT = process.env.PORT || 3000;
 const CACHE_TTL = 1000 * 60 * 60; // 1 hour
 const cache = {};
 
-// ---------- Helpers ----------
-function normNumberString(s) {
-  if (!s || typeof s !== "string") return null;
-  const cleaned = s.replace(/[^\d,.\s\u00A0]/g, "").trim();
+// helper: parse numbers like "25,000" or "1 234" or "25.000"
+function parseNumberToken(token) {
+  if (!token || typeof token !== "string") return null;
+  const cleaned = token.replace(/[^\d,.\s\u00A0]/g, "").trim();
   if (!cleaned) return null;
   let tmp = cleaned.replace(/\u00A0/g, "").replace(/\s+/g, "");
+  // remove thousands separators commonly used (commas or dots) but keep decimal dots (Roblox uses integers)
   tmp = tmp.replace(/,/g, "");
+  // if there are multiple dots treat them as thousand separators too
   if ((tmp.match(/\./g) || []).length > 1) tmp = tmp.replace(/\./g, "");
-  const n = parseInt(tmp, 10);
+  // final digits-only
+  const digits = tmp.replace(/[^\d]/g, "");
+  if (!digits) return null;
+  const n = parseInt(digits, 10);
   return Number.isFinite(n) ? n : null;
 }
 
-// ---------- Scraper ----------
-function sumLimitedValuesFromHtml(html) {
-  const $ = cheerio.load(html || "");
-
-  const sections = [
-    { key: "ugc", selector: "#inventoryugclimiteds" },
-    { key: "limited", selector: "#inventorylimiteds" },
-  ];
-
-  const results = { items: [], total: 0 };
-
-  for (const sec of sections) {
-    const root = $(sec.selector);
-    if (!root || !root.length) continue;
-
-    // Item containers (Rolimons renders cards/divs/lis)
-    root.find(".item-card, .card, .inventory-item, li, tr, div").each((i, el) => {
-      const name = $(el).find(".item-name, strong, .name").first().text().trim();
-      const valText = $(el).find(".value, .price, td, span").first().text().trim();
-      const val = normNumberString(valText);
-
-      if (val !== null && name) {
-        results.items.push({ name, value: val, type: sec.key });
-        results.total += val;
+// sum all numbers from a cheerio root using the exact span selector
+function sumSpansInRoot($, root, selector) {
+  const out = { values: [], samples: [] };
+  if (!root || !root.length) return out;
+  root.find(selector).each((i, el) => {
+    try {
+      const txt = $(el).text() || "";
+      const n = parseNumberToken(txt);
+      if (n !== null) {
+        out.values.push(n);
+        if (out.samples.length < 12) out.samples.push({ value: n, snippet: txt.trim().slice(0,100) });
       }
-    });
-  }
-
-  if (results.items.length === 0) return null;
-  return results;
+    } catch (e) {}
+  });
+  return out;
 }
 
-// Fallback: grab the largest number on page if nothing matched
-function fallbackExtractTotalFromHtml(html) {
-  const $ = cheerio.load(html || "");
-  const bodyText = $("body").text() || "";
-  const all = (bodyText.match(/[\d][\d,.\s\u00A0]{1,}/g) || [])
-    .map(normNumberString)
-    .filter(Boolean);
-  all.sort((a, b) => b - a);
-  return { total: all[0] || 0, candidates: all.slice(0, 10) };
-}
-
-async function fetchPlayerPage(userId) {
+// Try to fetch the player's Rolimons page
+async function fetchPlayerHtml(userId) {
   const url = `https://www.rolimons.com/player/${userId}`;
   const resp = await axios.get(url, {
     timeout: 10000,
-    headers: { "User-Agent": "AvatarValueProxy/limsum" },
+    headers: { "User-Agent": "AvatarValueProxy/scan-truncate" },
     validateStatus: null,
   });
-  return { url, status: resp.status, html: resp.data, headers: resp.headers };
+  return { status: resp.status, url, html: resp.data };
 }
 
-// ---------- Endpoints ----------
+app.get("/clearCache", (req, res) => {
+  const userId = req.query.userId;
+  if (!userId) return res.status(400).json({ error: "Missing userId" });
+  const key = `u:${userId}`;
+  delete cache[key];
+  return res.json({ ok: true, cleared: key });
+});
+
 app.get("/avatarValue", async (req, res) => {
   const userId = req.query.userId;
   const nocache = req.query.nocache === "1" || req.query.nocache === "true";
@@ -81,10 +68,10 @@ app.get("/avatarValue", async (req, res) => {
 
   if (!userId) return res.status(400).json({ error: "Missing userId" });
 
-  const key = `u:${userId}`;
-  const cached = cache[key];
+  const cacheKey = `u:${userId}`;
+  const cached = cache[cacheKey];
   if (!nocache && cached && Date.now() - cached.ts < CACHE_TTL) {
-    const out = { totalValue: cached.value, source: "cache" };
+    const out = { totalValue: cached.value, source: cached.source || "cache" };
     if (debug && cached.debug) out.debug = cached.debug;
     return res.json(out);
   }
@@ -92,34 +79,81 @@ app.get("/avatarValue", async (req, res) => {
   // fetch page
   let page;
   try {
-    page = await fetchPlayerPage(userId);
+    page = await fetchPlayerHtml(userId);
     if (!page || page.status !== 200) {
-      const fb = fallbackExtractTotalFromHtml(page?.html || "");
-      cache[key] = { value: fb.total, ts: Date.now(), debug: { fallback: true } };
-      return res.json({ totalValue: fb.total, source: "fallback" });
+      return res.status(502).json({ error: "Failed to fetch Rolimons page", status: page ? page.status : null });
     }
-  } catch (e) {
-    return res.status(502).json({ error: "fetch failed", reason: e.message });
+  } catch (err) {
+    return res.status(502).json({ error: "Fetch error", reason: err.message });
   }
 
-  // try section-sum
-  const sectionResult = sumLimitedValuesFromHtml(page.html);
-  if (sectionResult) {
-    cache[key] = { value: sectionResult.total, ts: Date.now(), debug: sectionResult };
-    const out = { totalValue: sectionResult.total, source: page.url };
-    if (debug) out.debug = sectionResult;
-    return res.json(out);
+  const $ = cheerio.load(page.html || "");
+  const selector = "span.text-light.text-truncate";
+
+  // prefer inventory sections
+  const sections = [
+    "#inventoryugclimiteds",
+    "#inventorylimiteds",
+    "div[id*='ugclimiteds']",
+    "div[id*='inventorylimiteds']",
+  ];
+
+  let collected = { values: [], samples: [], from: "none", sourceSelector: null };
+
+  for (const sel of sections) {
+    const root = $(sel);
+    if (root && root.length) {
+      const r = sumSpansInRoot($, root, selector);
+      if (r.values && r.values.length) {
+        collected = { values: r.values, samples: r.samples, from: sel, sourceSelector: selector };
+        break; --0; // eslint-disable-line no-unused-expressions
+      }
+    }
   }
 
-  // fallback
-  const fb = fallbackExtractTotalFromHtml(page.html);
-  cache[key] = { value: fb.total, ts: Date.now(), debug: { method: "fallback", candidates: fb.candidates } };
-  const out = { totalValue: fb.total, source: page.url };
-  if (debug) out.debug = { method: "fallback", candidates: fb.candidates };
+  // if not found in sections, fallback to scanning entire document for that selector
+  if (collected.values.length === 0) {
+    const rAll = sumSpansInRoot($, $.root(), selector);
+    if (rAll.values && rAll.values.length) {
+      collected = { values: rAll.values, samples: rAll.samples, from: "document", sourceSelector: selector };
+    }
+  }
+
+  // compute total
+  let total = 0;
+  if (collected.values.length) {
+    for (const v of collected.values) total += v;
+  } else {
+    // nothing found — fallback: try to extract any large integer-like numbers from the body (best-effort)
+    const bodyText = $("body").text() || "";
+    const tokens = (bodyText.match(/[\d][\d,.\s\u00A0]{1,}/g) || []).map(t => parseNumberToken(t)).filter(Boolean);
+    if (tokens.length) {
+      // pick the largest one as fallback (not ideal, but better than zero)
+      tokens.sort((a,b) => b - a);
+      total = tokens[0] || 0;
+      collected.samples = tokens.slice(0,12).map(v => ({ value: v, snippet: "fallback-body" }));
+    } else {
+      total = 0;
+    }
+  }
+
+  // cache + response
+  const debugObj = {
+    method: "scan-truncate",
+    collectedFrom: collected.from,
+    selector: collected.sourceSelector,
+    foundCount: (collected.values || []).length,
+    samples: collected.samples || [],
+  };
+
+  cache[cacheKey] = { value: total, ts: Date.now(), source: page.url, debug: debugObj };
+
+  const out = { totalValue: total, source: page.url };
+  if (debug) out.debug = debugObj;
   return res.json(out);
 });
 
-app.get("/", (req, res) => res.json({ ok: true, msg: "rolimons-proxy alive" }));
+app.get("/", (req, res) => res.json({ ok: true, msg: "rolimons-proxy scan-truncate alive" }));
 
-app.listen(PORT, () => console.log("rolimons-proxy listening on port", PORT));
+app.listen(PORT, () => console.log(`rolimons-proxy listening on port ${PORT}`));
 
